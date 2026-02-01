@@ -27,7 +27,7 @@ def open_grammar(filename: str) -> str:
         Path(HOME, "../grammars", f"{filename}.gbnf"), "r", encoding="utf8"
     ) as f:
         s = f.read()
-    return f
+    return s
 
 
 def moving_dots(n: int, N: int) -> str:
@@ -76,14 +76,18 @@ def launch_server(
     n = 0
     n_dots = 5
     while r.status_code == 503:
-        time.sleep(0.2)
-        r = requests.get(host)
-        if not verbose:
-            print(
-                f"Status code {r.status_code} ({responses[r.status_code]}){moving_dots(n,n_dots)} on localhost:{port} model: {model_name}",
-                end="\r",
-            )
-        n = (n + 1) % n_dots
+        try:
+            time.sleep(0.2)
+            r = requests.get(host)
+            if not verbose:
+                print(
+                    f"Status code {r.status_code} ({responses[r.status_code]}){moving_dots(n,n_dots)} on localhost:{port} model: {model_name}",
+                    end="\r",
+                )
+            n = (n + 1) % n_dots
+        except Exception:
+            time.sleep(0.2)
+            pass
     print("\n")
 
     if open_browser:

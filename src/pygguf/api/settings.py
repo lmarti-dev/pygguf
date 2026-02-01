@@ -7,4 +7,10 @@ HOME = Path(__file__).parent
 DATA_PATH = Path(HOME, "../../../../data/")
 
 MODELS = os.listdir(Path(DATA_PATH, "models"))
-LLAMAEXE = Path(DATA_PATH, r"bin\llama-b7058-bin-win-cuda-12.4-x64\llama-server.exe")
+
+if os.name == "posix":
+    LLAMAEXE = Path(DATA_PATH, "bin/llama-b7822/llama-server")
+else:
+    LLAMAEXE = Path(
+        DATA_PATH, r"bin\llama-b7058-bin-win-cuda-12.4-x64\llama-server.exe"
+    )
