@@ -1,3 +1,4 @@
+from typing import Callable
 import requests
 import subprocess
 from pathlib import Path
@@ -7,7 +8,7 @@ from http.client import responses
 import io
 from pygguf.api.img_utils import image_to_url, process_image
 import webbrowser
-
+import atexit
 
 from pygguf.api.settings import LLAMAEXE, MODELS, HOME, DATA_PATH
 
@@ -36,7 +37,30 @@ def moving_dots(n: int, N: int) -> str:
 
 
 def model_fpath(model_name: str) -> Path:
-    return Path(DATA_PATH, rf"models\{model_name}").absolute()
+    return Path(DATA_PATH, rf"models/{model_name}").resolve().absolute()
+
+
+def wait_for_llama(server:subprocess.Popen[bytes],host:str, timeout:float=30, interval:float=0.5,verbose:bool=False):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            if server.poll() is not None:  # process has exited
+                _, stderr = server.communicate()
+                raise RuntimeError(f"llama-server crashed:\n{stderr.decode()}")
+            r = requests.get(f"{host}/health", timeout=2)
+            if r.status_code == 200:
+                if verbose: 
+                    print("llama-server ready!")
+                return True
+            else:
+                if verbose:
+                    print(f"Status: {r.status_code}")
+        except requests.exceptions.ConnectionError as e:
+            if verbose: 
+                print(f"Exception: {e}")
+        time.sleep(interval)
+    raise TimeoutError(f"llama-server didn't start within {timeout}s")
+
 
 
 def launch_server(
@@ -45,11 +69,12 @@ def launch_server(
     verbose: bool = False,
     model_name: str = "gemma",
     open_browser: bool = False,
-):
+)->subprocess.Popen[bytes]:
+
     exe = LLAMAEXE
 
     if verbose:
-        kwargs = {"stdout": subprocess.PIPE}
+        kwargs = {"stdout": subprocess.PIPE,"stderr":subprocess.PIPE}
     else:
         kwargs = {"stderr": subprocess.DEVNULL, "stdout": subprocess.DEVNULL}
 
@@ -66,13 +91,16 @@ def launch_server(
         mmproj = f"--mmproj {model_fpath(mmproj_model)}"
     else:
         mmproj = ""
-    cmd = f"{exe} -m {model} --port {port} --offline -c {ctx} {mmproj} -ngl 99"
+    cmd = f"{exe} -m {model} --offline --port {port} -c {ctx} {mmproj}"
 
-    print(cmd)
+    print(cmd.split(" "))
 
-    server = subprocess.Popen(cmd, **kwargs)
+    cmds = [c for c in cmd.split(" ") if c != ""]
+
+    server:subprocess.Popen[bytes] = subprocess.Popen(cmds, **kwargs)
     host = f"http://localhost:{port}"
-    r = requests.get(host)
+    wait_for_llama(server,host)
+    r = requests.get(host,timeout=5)
     n = 0
     n_dots = 5
     while r.status_code == 503:
@@ -93,6 +121,10 @@ def launch_server(
     if open_browser:
         print(f"Opening {host}")
         webbrowser.open(host)
+    
+    ksfn = assign_server_killer(server)
+    atexit.register(ksfn)
+    return server
 
 
 def build_payload_oai(
@@ -115,7 +147,7 @@ def build_payload_oai(
         ]
     }
 
-    if json_schema:
+    if json_schema is not None:
         payload["response_format"] = {
             "type": "json_schema",
             "json_schema": {
@@ -195,32 +227,48 @@ def response_content(res: requests.Response, endpoint: str = OAI_ENDPOINT) -> di
             return jobj["content"]
 
 
-def open_for_kill():
+def open_for_kill(server:subprocess.Popen[bytes]):
     choice = ""
     while choice != "k":
         choice = input("Press k to kill the llama: ")
         print(f"You've pressed: {choice}")
-    kill_server()
+    kill_server(server)
 
 
-def kill_server():
-    cmd = f"taskkill /IM llama-server.exe /F"
-    print(cmd)
-    subprocess.Popen(cmd)
+def assign_server_killer(server:subprocess.Popen[bytes])->Callable:
+    def ksfn():
+        kill_server(server)
+    return ksfn
+
+def kill_server(server:subprocess.Popen[bytes]):
+
+    if server.poll() is not None:
+            return  # already dead
+    server.terminate()
+    try:
+        server.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        server.kill()
+        server.wait()
+    # if os.name=="posix":
+    #     cmd = f"fuser -k {port}/tcp"
+    #     print(cmd)
+    #     subprocess.Popen(cmd.split(" "))
+    # else:
+    #     cmd = f"taskkill /IM llama-server.exe /F"
+    #     print(cmd)
+    #     subprocess.Popen(cmd)
     print("Killed the llama")
 
 
+
 if __name__ == "__main__":
-    try:
+    available_models = [m for m in MODELS]
+    for ind, m in enumerate(available_models):
+        print(f"[{ind}] - {m}")
 
-        available_models = [m for m in MODELS]
-        for ind, m in enumerate(available_models):
-            print(f"[{ind}] - {m}")
+    num = input("Please pick the model's number: ")
 
-        num = input("Please pick the model's number: ")
-
-        model_name = available_models[int(num)]
-        launch_server(model_name=model_name, open_browser=True)
-        open_for_kill()
-    finally:
-        kill_server()
+    model_name = available_models[int(num)]
+    server = launch_server(model_name=model_name, open_browser=True)
+    # open_for_kill(server)
