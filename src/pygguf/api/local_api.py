@@ -62,13 +62,18 @@ def wait_for_llama(server:subprocess.Popen[bytes],host:str, timeout:float=30, in
     raise TimeoutError(f"llama-server didn't start within {timeout}s")
 
 
+def process_arg(arg):
+    if isinstance(arg,str) and arg.endswith(".gguf"):
+        return model_fpath(arg)
+    return arg
 
 def launch_server(
     port: int = 8080,
     ctx: int = int(2**13),
     verbose: bool = False,
-    model_name: str = "gemma",
+    model_name: str = "Assistant_Pepe_8B-Q8_0.gguf",
     open_browser: bool = False,
+    **sup_args,
 )->subprocess.Popen[bytes]:
 
     exe = LLAMAEXE
@@ -77,23 +82,13 @@ def launch_server(
         kwargs = {"stdout": subprocess.PIPE,"stderr":subprocess.PIPE}
     else:
         kwargs = {"stderr": subprocess.DEVNULL, "stdout": subprocess.DEVNULL}
-
-    mmproj_model = None
-    if model_name == "gemma":
-        model_name = "gemma/gemma-3-4b-it-Q4_K_M.gguf"
-        mmproj_model = "gemma/mmproj-F16.gguf"
-    elif model_name == "smolvlm":
-        model_name = "smolvlm/SmolVLM-Instruct-Q8_0.gguf"
-        mmproj_model = "smolvlm/mmproj-SmolVLM-Instruct-Q8_0.gguf"
-
     model = model_fpath(model_name)
-    if mmproj_model is not None:
-        mmproj = f"--mmproj {model_fpath(mmproj_model)}"
-    else:
-        mmproj = ""
-    cmd = f"{exe} -m {model} --offline --port {port} -c {ctx} {mmproj}"
+    cmd = f"{exe} -m {model} --offline --port {port} -c {ctx}" 
+    if sup_args is not None:
+        cmd = cmd + " " + " ".join([f"--{k} {process_arg(v)}" for k,v in sup_args.items()])
 
     print(cmd.split(" "))
+    print(cmd)
 
     cmds = [c for c in cmd.split(" ") if c != ""]
 
@@ -241,7 +236,6 @@ def assign_server_killer(server:subprocess.Popen[bytes])->Callable:
     return ksfn
 
 def kill_server(server:subprocess.Popen[bytes]):
-
     if server.poll() is not None:
             return  # already dead
     server.terminate()
