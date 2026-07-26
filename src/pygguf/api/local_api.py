@@ -101,8 +101,6 @@ def launch_server(
             + " "
             + " ".join([f"--{k} {process_arg(v)}" for k, v in sup_args.items()])
         )
-
-    print(cmd.split(" "))
     print(cmd)
 
     cmds = [c for c in cmd.split(" ") if c != ""]
@@ -158,7 +156,7 @@ def build_payload_oai(
         "messages": [
             {"role": "system", "content": system_prompt},
             user,
-        ]
+        ],"id_slot":0,"cache_prompt":True
     }
 
     if json_schema is not None:
@@ -333,13 +331,25 @@ def prompt(
     return res
 
 
-def response_content(res: requests.Response, endpoint: str = OAI_ENDPOINT) -> dict:
+def response_timings(res:requests.Response,endpoint:str=OAI_ENDPOINT)->dict:
+    jobj = res.json()
+    if endpoint == OAI_ENDPOINT:
+        if "error" in jobj.keys():
+            msg = jobj["error"]
+            raise RuntimeError(msg)
+        else:
+            return jobj["timings"]
+    else:
+        raise ValueError("Timings only work for OAI_ENDPOINT")
+
+
+def response_content(res: requests.Response, endpoint: str = OAI_ENDPOINT) -> str:
     return response_message_key(res=res, key="content", endpoint=endpoint)
 
 
 def response_message_key(
     res: requests.Response, key: str = "content", endpoint: str = OAI_ENDPOINT
-) -> dict:
+) -> str:
     jobj = res.json()
     if endpoint == OAI_ENDPOINT:
         if "error" in jobj.keys():
