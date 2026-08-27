@@ -1,33 +1,36 @@
-from multiprocessing.sharedctypes import Value
-from typing import Callable
-import requests
-import subprocess
-from pathlib import Path
-import time
-import json
-from http.client import responses
-import io
-from pygguf.api.img_utils import image_to_url, process_image
-import webbrowser
 import atexit
+import json
+import subprocess
+import time
+import webbrowser
+from collections.abc import Callable
+from http.client import responses
+from pathlib import Path
 
-from pygguf.api.settings import LLAMAEXE, MODELS, HOME, DATA_PATH
+import jinja2
+import requests
 
-
-OAI_ENDPOINT = "/v1/chat/completions"
-LLAMA_ENDPOINT = "/completion"
+from pygguf.api.img_utils import image_to_url, process_image
+from pygguf.api.settings import (
+    APPLY_TEMPLATE_ENDPOINT,
+    DATA_PATH,
+    HOME,
+    LLAMA_ENDPOINT,
+    LLAMAEXE,
+    MODELS,
+    OAI_ENDPOINT,
+    SYSTEM_PROMPT,
+)
 
 
 def load_json(fpath: Path) -> dict:
-    with io.open(fpath, "r", encoding="utf8") as f:
+    with open(fpath, "r", encoding="utf8") as f:
         jobj = json.loads(f.read())
     return jobj
 
 
 def open_grammar(filename: str) -> str:
-    with io.open(
-        Path(HOME, "../grammars", f"{filename}.gbnf"), "r", encoding="utf8"
-    ) as f:
+    with open(Path(HOME, "../grammars", f"{filename}.gbnf"), "r", encoding="utf8") as f:
         s = f.read()
     return s
 
@@ -52,7 +55,7 @@ def wait_for_llama(
     while time.time() - start < timeout:
         try:
             if server.poll() is not None:  # process has exited
-                stdout, stderr = server.communicate()
+                _, stderr = server.communicate()
                 if stderr:
                     raise RuntimeError(f"llama-server crashed:\n{stderr.decode()}")
                 else:
@@ -80,7 +83,7 @@ def process_arg(arg):
 
 def launch_server(
     port: int = 8080,
-    ctx: int = int(2**13),
+    ctx: int = 2**13,
     verbose: bool = False,
     model_name: str = "Assistant_Pepe_8B-Q8_0.gguf",
     open_browser: bool = False,
@@ -123,7 +126,7 @@ def launch_server(
             n = (n + 1) % n_dots
         except Exception:
             time.sleep(0.2)
-            pass
+
     print("\n")
 
     if open_browser:
@@ -138,10 +141,16 @@ def launch_server(
 def build_payload_oai(
     prompt_msg: str,
     image: Path,
-    system_prompt: str,
-    json_schema: str,
-    reasoning_budget: int=None,
+    system_prompt: str | None = None,
+    assistant_prompt: str | None = None,
+    json_schema: str | None = None,
+    reasoning_budget: int | None = None,
+    **chat_template_kwargs,
 ) -> dict:
+
+    if system_prompt is None:
+        system_prompt = SYSTEM_PROMPT
+
     content = [{"type": "text", "text": prompt_msg}]
     if image:
         content.append(
@@ -150,14 +159,17 @@ def build_payload_oai(
                 "image_url": {"url": image_to_url(image)},
             }
         )
-    user = {"role": "user", "content": content}
 
     payload = {
         "messages": [
             {"role": "system", "content": system_prompt},
-            user,
-        ],"id_slot":0,"cache_prompt":True
+            {"role": "user", "content": content},
+        ],
+        "id_slot": 0,
+        "cache_prompt": True,
     }
+    if assistant_prompt is not None:
+         payload["messages"].append({"role": "assistant", "content": assistant_prompt})
 
     if json_schema is not None:
         payload["response_format"] = {
@@ -170,147 +182,109 @@ def build_payload_oai(
         }
     if reasoning_budget is not None:
         payload["thinking_budget_tokens"] = reasoning_budget
+    if chat_template_kwargs:
+        payload.update(chat_template_kwargs)
     return payload
 
 
-def build_payload_llama(prompt_msg: str, image: Path, grammar: str):
-    payload = {}
+
+def _render_initial_prompt(system_prompt: str, prompt_msg: str, port: int) -> str:
+    """One /apply-template call, no generation. Gets the exact raw prompt
+    this model's template produces for a fresh turn -- including whatever
+    per-model reasoning-open tag it inserts -- without us needing to know
+    that template's syntax at all."""
+    host = f"http://localhost:{port}{APPLY_TEMPLATE_ENDPOINT}"
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt_msg},
+    ]
+    return requests.post(host, json={"messages": messages}).json()["prompt"]
+ 
+ 
+def build_payload_llama(
+    prompt_msg: str,
+    image: Path | None = None,
+    grammar: str | None = None,
+    system_prompt: str | None = None,
+    assistant_prompt: str | None = None,
+    port: int = 8080,
+    **chat_template_kwargs,
+) -> dict:
+    """
+    assistant_prompt: None for the first leg of a conversation -- the real
+        starting prompt gets rendered once via /apply-template. For every
+        continuation, pass the raw text generated + injected so far; it's
+        used exactly as given, no template re-application, nothing appended
+        or closed on your behalf. The model stays "open" for as long as you
+        keep extending this string yourself.
+    port: needed now because round-1 requires one live call to this
+        server's /apply-template to render the starting prompt.
+    """
+    payload = {"id_slot": 0, "cache_prompt": True}  # cache_prompt matters more here than
+                                                      # on the OAI side: every injection round
+                                                      # resends a longer version of the same
+                                                      # string, and this lets llama.cpp reuse
+                                                      # the common prefix instead of reprocessing it
+ 
+    if assistant_prompt is None:
+        raw_prompt = _render_initial_prompt(system_prompt or SYSTEM_PROMPT, prompt_msg, port)
+    else:
+        raw_prompt = assistant_prompt
+ 
     if image:
         payload["prompt"] = {
-            "prompt_string": prompt_msg,
+            "prompt_string": raw_prompt,
             "multimodal_data": process_image(image),
         }
     else:
-        payload["prompt"] = prompt_msg
+        payload["prompt"] = raw_prompt
+ 
     if grammar:
         payload["grammar"] = grammar
-
+    if chat_template_kwargs:
+        payload.update(chat_template_kwargs)
     return payload
 
 
+
 def load_schema(filename: Path) -> str:
-    with io.open(Path(HOME, "../../json_schema", filename)) as f:
+    with open(Path(HOME, "../../json_schema", filename)) as f:
         jobj = json.loads(f.read())
     return jobj
 
 
-def stream_chat(
-    prompt_msg: str,
-    port: int = 8080,
-    endpoint: str = None,
-    system_prompt: str = None,
-    on_token=None,
-    on_reasoning_token=None,
-    image: Path = None,
-    grammar: str = None,
-    json_schema: dict = None,
-) -> dict:
-    """
-    Streams a chat completion from llama-server, printing/live-updating as it goes,
-    but returns a single reconstructed JSON-like dict at the end containing:
-      - content
-      - reasoning_content (if the model emits it)
-      - finish_reason
-      - timings (llama-server specific)
-      - usage (if present)
-      - raw_chunks (all raw SSE chunks, in case you want to inspect anything else)
+def get_special_tokens(port: int = 8080):
+    props = requests.get(f"http://localhost:{port}/props").json()
+    template_str = props["chat_template"]
+    bos = props.get("bos_token", "")
+    eos = props.get("eos_token", "")
+    env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
+    template = env.from_string(template_str)
 
-    Args:
-        on_token: callback for each content token, e.g. lambda t: print(t, end="", flush=True)
-        on_reasoning_token: callback for each reasoning token, same signature
-    """
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-
-    content_parts = []
-    reasoning_parts = []
-    finish_reason = None
-    timings = None
-    usage = None
-    raw_chunks = []
-
-    if on_token is None:
-
-        def on_token(t):
-            print(t, end="", flush=True)
-
-    if on_reasoning_token is None:
-
-        def on_reasoning_token(t):
-            print(t, end="", flush=True)
-
-    if endpoint is None:
-        endpoint = OAI_ENDPOINT
-    host = f"http://localhost:{port}{endpoint}"
-
-    if endpoint == OAI_ENDPOINT:
-        payload = build_payload_oai(prompt_msg, image, system_prompt, json_schema)
-    elif endpoint == LLAMA_ENDPOINT:
-        payload = build_payload_llama(prompt_msg, image, grammar)
-
-    payload["stream"] = True
-
-    with requests.post(host, json=payload, stream=True) as response:
-        response.raise_for_status()
-        response.encoding = "utf-8"
-        for line in response.iter_lines(decode_unicode=True):
-            if not line or not line.startswith("data: "):
-                continue
-            data_str = line[len("data: ") :]
-            if data_str.strip() == "[DONE]":
-                break
-
-            chunk = json.loads(data_str)
-            raw_chunks.append(chunk)
-
-            choice = chunk["choices"][0]
-            delta = choice.get("delta", {})
-
-            token = delta.get("content")
-            if token:
-                content_parts.append(token)
-                if on_token:
-                    on_token(token)
-
-            reasoning_token = delta.get("reasoning_content")
-            if reasoning_token:
-                reasoning_parts.append(reasoning_token)
-                if on_reasoning_token:
-                    on_reasoning_token(reasoning_token)
-            if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
-
-            # llama-server attaches "timings" to chunks as generation progresses;
-            # the last one present is the most complete.
-            if "timings" in chunk:
-                timings = chunk["timings"]
-
-            if "usage" in chunk and chunk["usage"] is not None:
-                usage = chunk["usage"]
-
-    return {
-        "content": "".join(content_parts),
-        "reasoning_content": "".join(reasoning_parts) if reasoning_parts else None,
-        "finish_reason": finish_reason,
-        "timings": timings,
-        "usage": usage,
-        "raw_chunks": raw_chunks,
-    }
+    # Render with a dummy conversation + thinking enabled, no actual generation involved
+    rendered = template.render(
+        messages=[{"role": "user", "content": "PLACEHOLDER"}],
+        add_generation_prompt=True,
+        bos_token=bos,
+        eos_token=eos,
+        enable_thinking=True,  # matches the kwarg the server accepts
+    )
+    print(rendered)
 
 
 def prompt(
     prompt_msg: str,
     port: int = 8080,
-    image: Path = None,
-    system_prompt: str = None,
-    endpoint: str = None,
-    grammar: str = None,
-    json_schema: dict = None,
+    image: Path | None = None,
+    system_prompt: str | None = None,
+    endpoint: str | None = None,
+    grammar: str | None = None,
+    json_schema: dict | None = None,
+    reasoning_budget: int = 2**10,
+    **chat_template_kwargs,
 ) -> requests.Response:
     if system_prompt is None:
-        system_prompt = "You are an AI assistant. You only return the requested content without making comments."
+        system_prompt = SYSTEM_PROMPT
     elif isinstance(system_prompt, list):
         system_prompt = "\n".join(system_prompt)
 
@@ -321,9 +295,18 @@ def prompt(
     headers = {"Content-Type": "application/json", "Authorization": "Bearer no-key"}
 
     if endpoint == OAI_ENDPOINT:
-        payload = build_payload_oai(prompt_msg, image, system_prompt, json_schema)
+        payload = build_payload_oai(
+            prompt_msg,
+            image=image,
+            system_prompt=system_prompt,
+            json_schema=json_schema,
+            reasoning_budget=reasoning_budget,
+            **chat_template_kwargs,
+        )
     elif endpoint == LLAMA_ENDPOINT:
-        payload = build_payload_llama(prompt_msg, image, grammar)
+        payload = build_payload_llama(
+            prompt_msg, image, grammar, **chat_template_kwargs
+        )
 
     data = json.dumps(payload, ensure_ascii=False)
 
@@ -331,10 +314,10 @@ def prompt(
     return res
 
 
-def response_timings(res:requests.Response,endpoint:str=OAI_ENDPOINT)->dict:
+def response_timings(res: requests.Response, endpoint: str = OAI_ENDPOINT) -> dict:
     jobj = res.json()
     if endpoint == OAI_ENDPOINT:
-        if "error" in jobj.keys():
+        if "error" in jobj:
             msg = jobj["error"]
             raise RuntimeError(msg)
         else:
@@ -352,13 +335,13 @@ def response_message_key(
 ) -> str:
     jobj = res.json()
     if endpoint == OAI_ENDPOINT:
-        if "error" in jobj.keys():
+        if "error" in jobj:
             msg = jobj["error"]
             raise RuntimeError(msg)
         else:
             return jobj["choices"][0]["message"][key]
     elif endpoint == LLAMA_ENDPOINT:
-        if "error" in jobj.keys():
+        if "error" in jobj:
             msg = jobj["error"]
             raise RuntimeError(msg)
         else:
@@ -400,6 +383,10 @@ def kill_server(server: subprocess.Popen[bytes]):
     #     print(cmd)
     #     subprocess.Popen(cmd)
     print("Killed the llama")
+
+
+
+
 
 
 if __name__ == "__main__":
